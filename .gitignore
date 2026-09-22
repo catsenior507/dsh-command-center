@@ -1,0 +1,5 @@
+node_modules/
+
+# Local probing scripts and captured data, not part of the plugin.
+scratch/
+*.log

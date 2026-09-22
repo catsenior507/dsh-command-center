@@ -1,0 +1,6 @@
+# dsh-command-center bundle patch: inserts the host half (the job watcher and
+# its panel API) into the web roster.
+# Install with `dsh plugin --profile web add <path-or-git-url>`.
+- insert:
+    - id: ui-command-center
+      name: '@dsh-external/dsh-client-plugin-command-center'

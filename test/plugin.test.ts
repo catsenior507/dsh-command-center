@@ -1,0 +1,77 @@
+/**
+ * Tests for the plugin entry itself.
+ *
+ * This file exists because of a real bug: the wiring in `apply()` referenced a
+ * variable that had been deleted, and the plugin died with `ReferenceError`
+ * while every other test stayed green. The other suites test the pieces;
+ * nothing tested that the pieces are actually wired together, which is exactly
+ * where the mistake was made.
+ *
+ * `apply` is loaded and run for real here. A fake context supplies the two
+ * things it needs, and the carrier is asked a question over HTTP so the check
+ * covers the wiring rather than the fact that a function was called.
+ */
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { apply } from '../src/index.ts'
+
+const TEST_PORT = 4823
+
+/** The smallest context that can carry this plugin. */
+function fakeContext() {
+  const disposers: (() => void)[] = []
+  return {
+    disposers,
+    /** No jobs registry: this is what apply() sees, since the registry is
+     * registered after this plugin runs. */
+    get: () => undefined,
+    effect(callback: () => (() => void) | void) {
+      const dispose = callback()
+      if (typeof dispose === 'function') disposers.push(dispose)
+    },
+    logger: { info: () => {} },
+  }
+}
+
+/** Ask the carrier a question, trying the fallback ports it may have taken. */
+async function ask(path: string): Promise<{ port: number; body: unknown } | null> {
+  for (let port = TEST_PORT; port < TEST_PORT + 10; port += 1) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}${path}`)
+      if (res.ok) return { port, body: await res.json() }
+    } catch {
+      // Not this port; the carrier may have fallen back to the next one.
+    }
+  }
+  return null
+}
+
+test('apply wires up without throwing, and its disposer frees the port', async () => {
+  const ctx = fakeContext()
+  assert.doesNotThrow(() => { apply(ctx as never, { port: TEST_PORT }) })
+  // Let the listen callback run before disposing, so this asserts something
+  // real: a disposer that only works after the callback would pass a
+  // synchronous test while still leaking the handle.
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  for (const dispose of ctx.disposers) dispose()
+  await new Promise((resolve) => setTimeout(resolve, 200))
+  const after = await ask('/health')
+  assert.equal(after, null, 'the carrier still answers after disposal')
+})
+
+test('the carrier answers once apply has run', async () => {
+  const ctx = fakeContext()
+  apply(ctx as never, { port: TEST_PORT })
+  try {
+    const health = await ask('/health')
+    assert.ok(health !== null, 'no port in the range answered /health')
+    const body = health.body as { ok: boolean; observe: string }
+    assert.equal(body.ok, true)
+    assert.equal(body.observe, 'changed-only')
+    const tasks = await ask('/tasks')
+    assert.ok(tasks !== null)
+    assert.equal((tasks.body as { needsYou: number }).needsYou, 0)
+  } finally {
+    for (const dispose of ctx.disposers) dispose()
+  }
+})
