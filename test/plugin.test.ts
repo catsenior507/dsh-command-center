@@ -20,8 +20,10 @@ const TEST_PORT = 4823
 /** The smallest context that can carry this plugin. */
 function fakeContext() {
   const disposers: (() => void)[] = []
-  return {
+  const handlers = new Map<string, (...args: never[]) => unknown>()
+  const ctx = {
     disposers,
+    handlers,
     /** No jobs registry: this is what apply() sees, since the registry is
      * registered after this plugin runs. */
     get: () => undefined,
@@ -29,19 +31,35 @@ function fakeContext() {
       const dispose = callback()
       if (typeof dispose === 'function') disposers.push(dispose)
     },
+    // Both of these were missing, which is why this suite went red the moment
+    // apply() started using them: the observer hooks events and waits for the
+    // services it needs, and a stub that cannot do either is not a context.
+    on(event: string, listener: (...args: never[]) => unknown) {
+      handlers.set(event, listener)
+    },
+    inject(_names: string[], callback: (ctx: unknown) => void) {
+      callback(ctx)
+    },
     logger: { info: () => {} },
   }
+  return ctx
 }
 
 /** Ask the carrier a question, trying the fallback ports it may have taken. */
-async function ask(path: string): Promise<{ port: number; body: unknown } | null> {
-  for (let port = TEST_PORT; port < TEST_PORT + 10; port += 1) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}${path}`)
-      if (res.ok) return { port, body: await res.json() }
-    } catch {
-      // Not this port; the carrier may have fallen back to the next one.
+async function ask(path: string, attempts = 20): Promise<{ port: number; body: unknown } | null> {
+  // apply() starts listening asynchronously, so a single sweep can run before
+  // the socket is bound and report "no port answered" for a carrier that is
+  // about to. Poll the whole range for a moment instead of once.
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    for (let port = TEST_PORT; port < TEST_PORT + 10; port += 1) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}${path}`)
+        if (res.ok) return { port, body: await res.json() }
+      } catch {
+        // Not this port; the carrier may have fallen back to the next one.
+      }
     }
+    await new Promise((r) => setTimeout(r, 25))
   }
   return null
 }

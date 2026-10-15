@@ -14,7 +14,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { appendFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { handle, type Deps } from './host/api.ts'
+import { describe, FailureStreak, type FailureRecord } from './host/failures.ts'
 import { DurationHistory } from './host/liveness.ts'
 import { observeQuestions, QuestionWatch } from './host/questions.ts'
 import { sampleActivity, unionRegistry, type AgentsLike, type JobsLike } from './host/registry.ts'
@@ -33,6 +35,47 @@ interface Context {
   inject(names: string[], callback: (ctx: Context) => void): void
   effect(callback: () => (() => void) | void, label?: string): void
   on(event: string, listener: (...args: never[]) => unknown): void
+}
+
+/**
+ * Dig a named field out of whatever the failure payload happens to be.
+ *
+ * The payload shape belongs to the harness, so every read is defensive: a wrong
+ * guess yields undefined rather than an exception inside an error path.
+ * @param payload - the event payload.
+ * @param key - the field to look for, at the top level or under `failure`.
+ * @returns the value as a string when it is one, else undefined.
+ */
+function readFailure(payload: unknown, key: string): string | undefined {
+  const p = payload as Record<string, unknown> | null
+  if (p === null || typeof p !== 'object') return undefined
+  const direct = p[key]
+  if (typeof direct === 'string') return direct
+  const nested = (p.failure ?? (p.reason as Record<string, unknown> | undefined)?.failure) as
+    | Record<string, unknown>
+    | undefined
+  const value = nested?.[key]
+  if (typeof value === 'string') return value
+  if (Array.isArray(nested?.messages)) return nested.messages as never
+  if (Array.isArray(p.messages)) return p.messages as never
+  return undefined
+}
+
+/**
+ * Append one failure record as a JSON line.
+ *
+ * Append-only on purpose: the interesting pattern is the sequence, and a file
+ * rewritten per event would lose exactly that.
+ * @param record - the record to write.
+ */
+function appendFailure(record: unknown): void {
+  try {
+    const dir = join(homedir(), '.dsh', 'command-center')
+    mkdirSync(dir, { recursive: true })
+    appendFileSync(join(dir, 'llm-failures.jsonl'), JSON.stringify(record) + '\n')
+  } catch {
+    // Diagnostics must never break the path they are diagnosing.
+  }
 }
 
 /** The slice of the context this file uses after the jobs service appears. */
@@ -62,11 +105,43 @@ const OBSERVE = process.env.DSH_COMMAND_CENTER_READ_OUTPUT === 'i-have-verified-
  * Mount the plugin.
  * @param ctx - the cordis context.
  */
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config?: { port?: number }): void {
+  // Named port wins. A caller that asks for a port and is ignored scans a range
+  // nothing is listening on, which is exactly how this surfaced.
+  const basePort = config?.port ?? PORT_BASE
   const notes: string[] = []
   const questions = new QuestionWatch()
   ctx.on('user-questions/request', observeQuestions(questions) as never)
   notes.push('questions=observed')
+
+  // Records what was in flight whenever a model request fails. Measured
+  // 2026-10-15: one session failed all ten of its retries with STREAM_CLOSED -
+  // five in one turn, five in the next. Ten identical failures mean the request
+  // is the trigger, but the session log keeps only the error, so the shape of
+  // the request has to be captured here or not at all.
+  const streak = new FailureStreak()
+  ctx.on('agent/request-error', ((payload: unknown, next: () => unknown) => {
+    try {
+      const code = readFailure(payload, 'code') ?? 'UNKNOWN'
+      const shape = describe(readFailure(payload, 'messages'))
+      const count = streak.note(code)
+      const record: FailureRecord & { streak: number; deterministic: boolean } = {
+        at: Date.now(),
+        code,
+        message: readFailure(payload, 'message') ?? '',
+        shape,
+        streak: count,
+        // Two in a row is the threshold: one failure is noise, two identical
+        // ones mean repeating the request is very unlikely to help.
+        deterministic: streak.looksDeterministic(2),
+      }
+      appendFailure(record)
+    } catch {
+      // Observation must never be the reason a request fails.
+    }
+    return next()
+  }) as never)
+  notes.push('failures=observed')
 
   let watch: TaskWatch | null = null
   // Waited for rather than read now. Reading synchronously is a race, and the
@@ -125,8 +200,8 @@ export function apply(ctx: Context): void {
     const attempt = (offset: number): void => {
       if (offset >= PORT_ATTEMPTS) { notes.push('api=failed'); record(notes); return }
       server.once('error', () => attempt(offset + 1))
-      server.listen(PORT_BASE + offset, '127.0.0.1', () => {
-        listening = PORT_BASE + offset
+      server.listen(basePort + offset, '127.0.0.1', () => {
+        listening = basePort + offset
         notes.push('api=' + String(listening))
         record(notes)
       })
