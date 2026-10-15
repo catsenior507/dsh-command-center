@@ -14,6 +14,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { apply } from '../src/index.ts'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+// Diagnostics go to a scratch directory. Without this the suite appends to the
+// real log, and the real log then claims the live host applied with no services.
+process.env.DSH_COMMAND_CENTER_DATA = mkdtempSync(join(tmpdir(), 'cc-test-'))
 
 const TEST_PORT = 4823
 

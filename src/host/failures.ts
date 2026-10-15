@@ -1,16 +1,17 @@
 /**
- * Records the shape of a request that failed, so the next investigation starts
- * from facts instead of hypotheses.
+ * Records what a failed model request was, so the next investigation starts from
+ * facts instead of hypotheses.
  *
- * Why this exists: a session on this machine failed every retry - five attempts
- * in one turn, five in the next - and all ten died with STREAM_CLOSED. Ten
- * identical failures mean the request itself is the trigger, not the network.
- * But the session log records only the error, never what was sent, so finding
- * the trigger meant reading the whole log by hand and guessing. Twice those
- * guesses were wrong.
+ * Why this exists: a session on this machine lost all twelve of its attempts -
+ * five in one turn, five in the next, two in a third - every one STREAM_CLOSED.
+ * Twelve identical failures say the request is the trigger, not the network.
+ * The session log keeps only the error, never what was sent.
  *
- * This writes down what was in flight: how many messages, how many tool calls,
- * how large, and what the tail looked like. That is the evidence the log lacked.
+ * The payload shape is taken from the harness declaration rather than guessed:
+ * `dsh-agent/lib/types/runtime-types.d.ts` declares `agent/request-error` as
+ * { agent, turn, step, provider, failure, retryPolicy, signal }. The first
+ * version of this file looked for `messages` there, found nothing, and recorded
+ * a shape of all zeros. Read the type first.
  *
  * @module dsh-command-center/host/failures
  */
@@ -20,29 +21,65 @@ export interface FailureRecord {
   at: number
   code: string
   message: string
-  /** Shape of the conversation at the moment of failure. */
+  turn: number | null
+  step: number | null
+  provider: string | null
+  /**
+   * The complete failure object as the adapter normalized it.
+   *
+   * Recorded whole rather than picked apart: the fields worth having are the
+   * ones nobody thought to name, and an HTTP status hiding in here would say
+   * more about the cause than anything already known.
+   */
+  failure: unknown
+  /** The retry policy in force, which also proves which config was loaded. */
+  retryPolicy: unknown
+  /** Conversation size, when the agent could be read. */
   shape: {
     messages: number
     toolCalls: number
     characters: number
-    /** Content kinds of the last few messages, oldest first. */
-    tailKinds: string[]
   }
+  /**
+   * Key names of the agent and its session.
+   *
+   * Recorded so an unknown shape becomes known after one failure instead of
+   * after another round of guessing at where the conversation lives.
+   */
+  agentKeys: string[]
+  sessionKeys: string[]
 }
 
 /**
- * Describe a conversation without recording its contents.
+ * Read a numeric field without trusting its shape.
+ * @param value - the candidate.
+ * @returns the number, or null.
+ */
+export function num(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+/**
+ * Read a string field without trusting its shape.
+ * @param value - the candidate.
+ * @returns the string, or null.
+ */
+export function str(value: unknown): string | null {
+  return typeof value === 'string' && value !== '' ? value : null
+}
+
+/**
+ * Count a conversation without keeping any of it.
  *
- * Counts only. The conversation is the user's private data; the shape is what
- * answers "what was different about this request", and it is safe to keep.
+ * The conversation is the user's private data; the size is what answers "was
+ * this request unusually large", and it is safe to store.
  * @param messages - the message list, in whatever shape the caller has.
- * @returns the shape summary.
+ * @returns the counts.
  */
 export function describe(messages: unknown): FailureRecord['shape'] {
   const list = Array.isArray(messages) ? messages : []
   let toolCalls = 0
   let characters = 0
-  const tailKinds: string[] = []
   for (const m of list) {
     const msg = m as { content?: unknown }
     const parts = Array.isArray(msg?.content) ? msg.content : []
@@ -53,14 +90,7 @@ export function describe(messages: unknown): FailureRecord['shape'] {
     }
     if (typeof msg?.content === 'string') characters += msg.content.length
   }
-  for (const m of list.slice(-4)) {
-    const msg = m as { role?: unknown; content?: unknown }
-    const kinds = Array.isArray(msg?.content)
-      ? msg.content.map((p) => String((p as { type?: unknown })?.type ?? '?'))
-      : [typeof msg?.content]
-    tailKinds.push(String(msg?.role ?? '?') + ':' + kinds.join('+'))
-  }
-  return { messages: list.length, toolCalls, characters, tailKinds }
+  return { messages: list.length, toolCalls, characters }
 }
 
 /**
@@ -68,8 +98,8 @@ export function describe(messages: unknown): FailureRecord['shape'] {
  *
  * The point is to tell "the network hiccupped" from "this request cannot
  * succeed". The first deserves patience; the second deserves to be reported
- * early, because repeating an identical request has no chance of a different
- * outcome and only makes the failure slower.
+ * early, because repeating an identical request cannot have a different outcome
+ * and only makes the failure slower.
  */
 export class FailureStreak {
   private code: string | null = null

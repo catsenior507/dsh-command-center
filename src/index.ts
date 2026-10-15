@@ -16,7 +16,7 @@ import { appendFileSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { handle, type Deps } from './host/api.ts'
-import { describe, FailureStreak, type FailureRecord } from './host/failures.ts'
+import { describe, FailureStreak, num, str, type FailureRecord } from './host/failures.ts'
 import { DurationHistory } from './host/liveness.ts'
 import { observeQuestions, QuestionWatch } from './host/questions.ts'
 import { sampleActivity, unionRegistry, type AgentsLike, type JobsLike } from './host/registry.ts'
@@ -38,27 +38,39 @@ interface Context {
 }
 
 /**
- * Dig a named field out of whatever the failure payload happens to be.
+ * Reach the conversation through the agent, if the shape allows it.
  *
- * The payload shape belongs to the harness, so every read is defensive: a wrong
- * guess yields undefined rather than an exception inside an error path.
- * @param payload - the event payload.
- * @param key - the field to look for, at the top level or under `failure`.
- * @returns the value as a string when it is one, else undefined.
+ * The declaration says the payload carries an `agent`, not a message list, so
+ * the messages have to be found through it - and its layout is not declared
+ * here. Every path is tried defensively and undefined is a valid answer: the
+ * caller records zeroes and, more usefully, the key names it did see, so the
+ * next failure says where to look instead of failing silently.
+ * @param agent - the agent from the payload.
+ * @returns the message list when one could be found.
  */
-function readFailure(payload: unknown, key: string): string | undefined {
-  const p = payload as Record<string, unknown> | null
-  if (p === null || typeof p !== 'object') return undefined
-  const direct = p[key]
-  if (typeof direct === 'string') return direct
-  const nested = (p.failure ?? (p.reason as Record<string, unknown> | undefined)?.failure) as
-    | Record<string, unknown>
-    | undefined
-  const value = nested?.[key]
-  if (typeof value === 'string') return value
-  if (Array.isArray(nested?.messages)) return nested.messages as never
-  if (Array.isArray(p.messages)) return p.messages as never
+function readMessages(agent: unknown): unknown {
+  const a = agent as { session?: unknown; messages?: unknown } | null
+  if (a === null || typeof a !== 'object') return undefined
+  const s = a.session as { messages?: unknown; history?: unknown; state?: unknown } | undefined
+  if (Array.isArray(s?.messages)) return s.messages
+  if (Array.isArray(s?.history)) return s.history
+  const state = s?.state as { messages?: unknown } | undefined
+  if (Array.isArray(state?.messages)) return state.messages
+  if (Array.isArray(a.messages)) return a.messages
   return undefined
+}
+
+/**
+ * List the key names of whatever an object exposes.
+ *
+ * Recorded so an unknown shape becomes known after one failure rather than
+ * after another round of guessing.
+ * @param value - the object to inspect.
+ * @returns its own key names, capped.
+ */
+function keysOf(value: unknown): string[] {
+  if (value === null || typeof value !== 'object') return []
+  return Object.keys(value as Record<string, unknown>).slice(0, 24)
 }
 
 /**
@@ -68,9 +80,24 @@ function readFailure(payload: unknown, key: string): string | undefined {
  * rewritten per event would lose exactly that.
  * @param record - the record to write.
  */
+/**
+ * Where diagnostics are written.
+ *
+ * Overridable, because a test that calls apply() would otherwise append to the
+ * real log - and then the log reads as though the live host had restarted with
+ * no services at all, which happened and cost a round of confusion: the last
+ * two lines said `jobs=false agents=false api=4823`, and 4823 is a test port.
+ * @returns the directory diagnostics belong in.
+ */
+function dataDir(): string {
+  const override = process.env.DSH_COMMAND_CENTER_DATA
+  if (override !== undefined && override !== '') return override
+  return join(homedir(), '.dsh', 'command-center')
+}
+
 function appendFailure(record: unknown): void {
   try {
-    const dir = join(homedir(), '.dsh', 'command-center')
+    const dir = dataDir()
     mkdirSync(dir, { recursive: true })
     appendFileSync(join(dir, 'llm-failures.jsonl'), JSON.stringify(record) + '\n')
   } catch {
@@ -115,21 +142,45 @@ export function apply(ctx: Context, config?: { port?: number }): void {
   notes.push('questions=observed')
 
   // Records what was in flight whenever a model request fails. Measured
-  // 2026-10-15: one session failed all ten of its retries with STREAM_CLOSED -
-  // five in one turn, five in the next. Ten identical failures mean the request
-  // is the trigger, but the session log keeps only the error, so the shape of
-  // the request has to be captured here or not at all.
+  // 2026-10-15: one session lost all twelve of its attempts to STREAM_CLOSED -
+  // five in one turn, five in the next, two in a third, with no success between
+  // them. Twelve identical failures mean the request is the trigger, but the
+  // session log keeps only the error, so what was sent has to be captured here.
+  //
+  // Fields are read by name from the declaration, not guessed:
+  // dsh-agent/lib/types/runtime-types.d.ts declares this event as
+  // { agent, turn, step, provider, failure, retryPolicy, signal }. The first
+  // version looked for `messages` in it, found nothing, and wrote a shape of
+  // all zeros for twelve consecutive failures.
   const streak = new FailureStreak()
   ctx.on('agent/request-error', ((payload: unknown, next: () => unknown) => {
     try {
-      const code = readFailure(payload, 'code') ?? 'UNKNOWN'
-      const shape = describe(readFailure(payload, 'messages'))
+      const p = (payload ?? {}) as {
+        agent?: unknown
+        turn?: unknown
+        step?: unknown
+        provider?: unknown
+        failure?: { code?: unknown; message?: unknown }
+        retryPolicy?: unknown
+      }
+      const code = str(p.failure?.code) ?? 'UNKNOWN'
       const count = streak.note(code)
       const record: FailureRecord & { streak: number; deterministic: boolean } = {
         at: Date.now(),
         code,
-        message: readFailure(payload, 'message') ?? '',
-        shape,
+        message: str(p.failure?.message) ?? '',
+        turn: num(p.turn),
+        step: num(p.step),
+        provider: str(p.provider),
+        // The whole failure object rather than the two fields already known: a
+        // field nobody thought to name may be the one that identifies the cause.
+        failure: p.failure ?? null,
+        retryPolicy: p.retryPolicy ?? null,
+        shape: describe(readMessages(p.agent)),
+        // Self-diagnosing: if the conversation could not be reached, these say
+        // where it actually lives, so the next failure needs no new guesswork.
+        agentKeys: keysOf(p.agent),
+        sessionKeys: keysOf((p.agent as { session?: unknown } | undefined)?.session),
         streak: count,
         // Two in a row is the threshold: one failure is noise, two identical
         // ones mean repeating the request is very unlikely to help.
@@ -226,7 +277,7 @@ export function apply(ctx: Context, config?: { port?: number }): void {
 function record(notes: string[]): void {
   const line = new Date().toISOString() + ' apply: ' + notes.join(' ')
   try {
-    const dir = homedir() + '\\.dsh\\command-center'
+    const dir = dataDir()
     mkdirSync(dir, { recursive: true })
     appendFileSync(dir + '\\startup.log', line + "\n")
   } catch {
