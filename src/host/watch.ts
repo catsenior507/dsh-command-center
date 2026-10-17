@@ -22,9 +22,9 @@ export interface JobView {
  * The slice of the job registry this watcher uses.
  *
  * No change subscription, deliberately. dsh 0.2.x removed `onJobsChanged` from
- * `JobRegistry`, so anything that subscribes is written against exactly one
- * version. Polling `list()` works on both, and a task board that refreshes
- * every couple of seconds is indistinguishable to the person reading it.
+ * `JobRegistry`, and this plugin targets that API only, so there is no event to
+ * subscribe to. Polling `list()` every couple of seconds costs nothing worth
+ * measuring and keeps the timing logic in one place.
  */
 export interface RegistryLike {
   list(): JobView[]

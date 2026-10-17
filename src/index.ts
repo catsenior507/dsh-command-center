@@ -19,7 +19,7 @@ import { handle, type Deps } from './host/api.ts'
 import { describe, FailureStreak, num, str, type FailureRecord } from './host/failures.ts'
 import { DurationHistory } from './host/liveness.ts'
 import { observeQuestions, QuestionWatch } from './host/questions.ts'
-import { sampleActivity, unionRegistry, type AgentsLike, type JobsLike } from './host/registry.ts'
+import { adaptRegistry, type JobsLike } from './host/registry.ts'
 import { TaskWatch } from './host/watch.ts'
 
 export const name = '@dsh-external/dsh-client-plugin-command-center'
@@ -112,21 +112,18 @@ const PORT_BASE = 4811
 const PORT_ATTEMPTS = 8
 
 /**
- * Whether the watcher may consume job output to measure silence.
+ * What the panel is told about silence: it is not measured.
  *
- * MEASURED, 2026-09-22: it may not. With this flag on, a background task that was
- * plainly printing produced an EMPTY `job_output` for the agent - the consuming
- * cursor in `JobRegistry.read` belongs to the job, not to the caller, so a second
- * reader takes the delta away from the first. The mode was reverted the same day.
+ * A constant, and the only truthful value today. The watcher once had a read
+ * mode that sampled `JobRegistry.read` to see output arrive; MEASURED 2026-09-22,
+ * that consumes the delta, so a background task that was plainly printing
+ * produced an EMPTY `job_output` for the agent. The mode is gone.
  *
- * The gate name was changed from DSH_COMMAND_CENTER_OBSERVE after the revert did
- * not stick: the watchdog re-captures the host environment on every restart, so a
- * value written into its snapshot is copied back from the live host and re-armed
- * the theft. A new name that nothing sets cannot be resurrected that way.
- *
- * Do not turn this on again without a way to read output that does not consume it.
+ * dsh 0.2.x added `readAt(id, from)`, which reads at an absolute offset without
+ * consuming — that is the right foundation for a real silence signal, and when
+ * one is built this constant is what it replaces.
  */
-const OBSERVE = process.env.DSH_COMMAND_CENTER_READ_OUTPUT === 'i-have-verified-this-is-safe' ? 'read' : 'changed-only'
+const OBSERVE = 'changed-only'
 
 /**
  * Mount the plugin.
@@ -197,28 +194,23 @@ export function apply(ctx: Context, config?: { port?: number }): void {
   let watch: TaskWatch | null = null
   // Waited for rather than read now. Reading synchronously is a race, and the
   // winner is decided by roster order - the earlier build reported jobs=missing
-  // purely because it happened to apply before the registry did. `agents` is
-  // needed for the same reason `jobs` is: see unionRegistry.
-  ctx.inject(['jobs', 'agents'], (ready: Wired) => {
+  // purely because it happened to apply before the registry did.
+  ctx.inject(['jobs'], (ready: Wired) => {
     const jobs = ready.get('jobs') as JobsLike | undefined
-    const agents = ready.get('agents') as AgentsLike | undefined
-    if (jobs === undefined || agents === undefined) {
-      notes.push('jobs=' + String(jobs !== undefined) + ' agents=' + String(agents !== undefined))
+    if (jobs === undefined) {
+      notes.push('jobs=false')
       record(notes)
       return
     }
-    watch = new TaskWatch(unionRegistry(jobs, agents), { history: new DurationHistory() })
+    watch = new TaskWatch(adaptRegistry(jobs), { history: new DurationHistory() })
     watch.start()
     notes.push('jobs=watched')
-    notes.push('observe=' + OBSERVE)
-    if (OBSERVE === 'read') {
-      // Sampling is what turns elapsed time into a measured silence. Until this
-      // runs, the panel says it has no activity data - which is the truth.
-      const timer = setInterval(() => {
-        try { sampleActivity(jobs, agents, watch as never) } catch { /* keep ticking */ }
-      }, 2000)
-      ctx.effect(() => () => { clearInterval(timer) }, 'command-center: activity sampler')
-    }
+    // Reported as a fixed fact now. The mode used to switch on an env var so the
+    // watcher could sample output; that sampler took output away from the
+    // agent's own job_output, and dsh 0.2.x's readAt is the right tool when the
+    // silence signal is rebuilt. Until then the panel is told, in every reply,
+    // that silence is not measured.
+    notes.push('observe=changed-only')
     record(notes)
   })
   record(notes)
