@@ -11,12 +11,13 @@
  */
 import type { JobView, RegistryLike } from './watch.ts'
 
-/** The slice of `ctx.jobs` used here. */
+/** The slice of `ctx.jobs` used here, across both dsh generations. */
 export interface JobsLike {
   list(caller?: unknown): JobView[]
   /** Returns the consuming delta since the previous read for this caller. */
   read?(id: string, caller?: unknown): { text: string }
-  onJobsChanged(listener: () => void): () => void
+  /** Present from dsh 0.2.x only; used to tell the two API generations apart. */
+  get?(id: string, caller?: unknown): unknown
 }
 
 /** The slice of `ctx.agents` used here. */
@@ -80,8 +81,19 @@ export function sampleActivity(
  * @returns a registry view the watcher can use.
  */
 export function unionRegistry(jobs: JobsLike, agents: AgentsLike): RegistryLike {
+  // Two API generations. dsh 0.2.x replaced `list(Agent)` with `list(SessionId)`
+  // and added `get()`, which 0.1.x does not have; that one method is enough to
+  // tell them apart without depending on a version string.
+  //
+  // On the new API the union is not merely unnecessary, it is wrong: passing an
+  // agent where a session id is expected asks a question the registry cannot
+  // answer. One unfenced call returns everything the panel should show.
+  const newApi = typeof jobs.get === 'function'
   return {
     list(): JobView[] {
+      if (newApi) {
+        try { return jobs.list() } catch { return [] }
+      }
       const byId = new Map<string, JobView>()
       const collect = (caller?: unknown): void => {
         try {
@@ -94,6 +106,5 @@ export function unionRegistry(jobs: JobsLike, agents: AgentsLike): RegistryLike 
       for (const agent of agents.list()) collect(agent)
       return [...byId.values()]
     },
-    onJobsChanged: (listener: () => void) => jobs.onJobsChanged(listener),
   }
 }

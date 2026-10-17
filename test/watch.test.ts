@@ -6,21 +6,20 @@ import { historyKey, TaskWatch, type JobView } from '../src/host/watch.ts'
 
 const T0 = 1_700_000_000_000
 
-/** A registry whose contents the test drives directly. */
+/**
+ * A registry whose contents the test drives directly.
+ *
+ * No change subscription: the watcher polls, because dsh 0.2.x removed the
+ * event it used to subscribe to. `reads` counts how often the watcher looked,
+ * which is how the polling actually gets asserted.
+ */
 function fakeRegistry(initial: JobView[]) {
   let jobs = initial
-  const listeners = new Set<() => void>()
+  let reads = 0
   return {
-    list: () => jobs,
-    onJobsChanged: (fn: () => void) => {
-      listeners.add(fn)
-      return () => listeners.delete(fn)
-    },
-    set(next: JobView[]) {
-      jobs = next
-      for (const fn of listeners) fn()
-    },
-    listenerCount: () => listeners.size,
+    list: () => { reads += 1; return jobs },
+    set(next: JobView[]) { jobs = next },
+    reads: () => reads,
   }
 }
 
@@ -28,15 +27,30 @@ function job(over: Partial<JobView> = {}): JobView {
   return { id: 'bash-1', kind: 'bash', label: 'pytest -q', status: 'running', startedAt: T0, ...over }
 }
 
-test('start subscribes once and is idempotent', () => {
+test('start reads immediately and is idempotent', () => {
   const reg = fakeRegistry([job()])
-  const w = new TaskWatch(reg, { now: () => T0 })
+  const w = new TaskWatch(reg, { now: () => T0, pollMs: 60_000 })
+  const before = reg.reads()
   const off = w.start()
-  assert.equal(reg.listenerCount(), 1)
-  w.start()
-  assert.equal(reg.listenerCount(), 1, 'a second start must not double-subscribe')
+  assert.ok(reg.reads() > before, 'start must reconcile at once, not wait for the first tick')
+  const afterStart = reg.reads()
+  const same = w.start()
+  assert.equal(same, off, 'a second start returns the same disposer')
+  assert.equal(reg.reads(), afterStart, 'and does not start a second poller')
   off()
-  assert.equal(reg.listenerCount(), 0)
+})
+
+test('the poller keeps reading until disposed', async () => {
+  const reg = fakeRegistry([job()])
+  const w = new TaskWatch(reg, { now: () => T0, pollMs: 5 })
+  const off = w.start()
+  const before = reg.reads()
+  await new Promise((r) => setTimeout(r, 40))
+  assert.ok(reg.reads() > before + 1, 'it should have polled more than once')
+  off()
+  const atDispose = reg.reads()
+  await new Promise((r) => setTimeout(r, 40))
+  assert.equal(reg.reads(), atDispose, 'disposal must stop the polling')
 })
 
 test('a job that just spoke is live', () => {

@@ -18,10 +18,16 @@ export interface JobView {
   finishedAt?: number
 }
 
-/** The slice of the job registry this watcher uses. */
+/**
+ * The slice of the job registry this watcher uses.
+ *
+ * No change subscription, deliberately. dsh 0.2.x removed `onJobsChanged` from
+ * `JobRegistry`, so anything that subscribes is written against exactly one
+ * version. Polling `list()` works on both, and a task board that refreshes
+ * every couple of seconds is indistinguishable to the person reading it.
+ */
 export interface RegistryLike {
   list(): JobView[]
-  onJobsChanged(listener: () => void): () => void
 }
 
 /** One row the panel renders. */
@@ -41,6 +47,8 @@ export interface WatchOptions {
   now?: () => number
   /** Shared history of how long comparable work takes. */
   history?: DurationHistory
+  /** How often to re-read the registry, in milliseconds. */
+  pollMs?: number
 }
 
 /**
@@ -56,6 +64,7 @@ export class TaskWatch {
   private readonly registry: RegistryLike
   private readonly now: () => number
   private readonly history: DurationHistory
+  private readonly pollMs: number
   private readonly lastActivity = new Map<string, number>()
   private readonly startedAt = new Map<string, number>()
   private disposed: (() => void) | null = null
@@ -64,17 +73,21 @@ export class TaskWatch {
     this.registry = registry
     this.now = options.now ?? (() => Date.now())
     this.history = options.history ?? new DurationHistory()
+    this.pollMs = options.pollMs ?? 2000
   }
 
-  /** Subscribe to registry changes. Returns the disposer. */
+  /** Begin refreshing from the registry. Returns the disposer. */
   start(): () => void {
     if (this.disposed !== null) return this.disposed
-    const off = this.registry.onJobsChanged(() => {
-      this.reconcile()
-    })
     this.reconcile()
+    const timer = setInterval(() => {
+      try { this.reconcile() } catch { /* one bad read must not stop the clock */ }
+    }, this.pollMs)
+    // Node keeps the process alive for a referenced interval; this plugin must
+    // not be the reason a host cannot shut down.
+    if (typeof timer.unref === 'function') timer.unref()
     this.disposed = () => {
-      off()
+      clearInterval(timer)
       this.disposed = null
     }
     return this.disposed

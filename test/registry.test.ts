@@ -57,3 +57,39 @@ test('no agents and no unowned jobs is an empty list, not an error', () => {
   const view = unionRegistry(fenced(new Map()), { list: () => [] })
   assert.deepEqual(view.list(), [])
 })
+
+
+test('the 0.2.x API is detected by get(), and the union is skipped', () => {
+  // A registry shaped like dsh 0.2.x: get() exists, and list() takes a session
+  // id rather than an agent.
+  const calls: unknown[] = []
+  const newApi = {
+    get: () => ({ id: 'bash-1' }),
+    list(caller?: unknown) {
+      calls.push(caller)
+      return [{ id: 'bash-1', kind: 'bash', label: 'pytest -q', status: 'running', startedAt: T0 }]
+    },
+  }
+  // If the union ran, it would call this and pollute the caller list.
+  const agents = { list: () => [{ id: 'agent-a' }] }
+  const view = unionRegistry(newApi as never, agents as never)
+  const jobs = view.list()
+  assert.equal(jobs.length, 1)
+  assert.deepEqual(calls, [undefined], 'exactly one unfenced call, not one per agent')
+})
+
+test('without get(), the union still runs per agent', () => {
+  const calls: unknown[] = []
+  const oldApi = {
+    list(caller?: unknown) {
+      calls.push(caller)
+      return caller === undefined
+        ? []
+        : [{ id: 'bash-1', kind: 'bash', label: 'pytest -q', status: 'running', startedAt: T0 }]
+    },
+  }
+  const agents = { list: () => [{ id: 'agent-a' }] }
+  const view = unionRegistry(oldApi as never, agents as never)
+  assert.equal(view.list().length, 1, 'found through the agent, not through the unfenced call')
+  assert.equal(calls.length, 2, 'one unfenced plus one per agent')
+})
